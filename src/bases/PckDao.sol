@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import {CA} from "../Common.sol";
 import {PCKHelper, X509CertObj} from "../helpers/PCKHelper.sol";
+import {X509Helper} from "../helpers/X509Helper.sol";
 import {X509CRLHelper, X509CRLObj} from "../helpers/X509CRLHelper.sol";
 
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
@@ -59,6 +60,17 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
 
     // bf00a30d
     error Pck_Out_Of_Date();
+
+    // 55910199
+    error Invalid_Qeid_Length();
+    // 9502e28d
+    error Invalid_Pceid_Length();
+    // 03a471a6
+    error Invalid_Platform_Cpu_Svn_Length();
+    // ad582778
+    error Invalid_Platform_Pce_Svn_Length();
+    // 3d07e1f3
+    error Invalid_Tcbm_Length();
 
     event UpsertedPckCollateral(CA indexed ca, bytes16 indexed qeid, bytes2 indexed pceid, bytes18 tcbm);
 
@@ -120,8 +132,9 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
         string calldata platformPceSvn,
         string calldata pceid
     ) external view returns (bytes memory pckCert) {
-        (bytes16 qeidBytes, bytes2 pceidBytes, bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes,) =
-            _parseStringInputs(qeid, pceid, platformCpuSvn, platformPceSvn, "");
+        (bytes16 qeidBytes, bytes2 pceidBytes) = _parseQeidAndPceid(qeid, pceid);
+        (bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes) =
+            _parsePlatformSvns(platformCpuSvn, platformPceSvn);
         bytes18 tcbmBytes =
             _tcbrToTcbmMapping(TCB_MAPPING_KEY(qeidBytes, pceidBytes, platformCpuSvnBytes, platformPceSvnBytes));
         if (tcbmBytes != bytes18(0)) {
@@ -134,7 +147,7 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
         view
         returns (string[] memory tcbms, bytes[] memory pckCerts)
     {
-        (bytes16 qeidBytes, bytes2 pceidBytes,,,) = _parseStringInputs(qeid, pceid, "", "", "");
+        (bytes16 qeidBytes, bytes2 pceidBytes) = _parseQeidAndPceid(qeid, pceid);
 
         bytes18[] memory tcbmBytes = _getAllTcbs(qeidBytes, pceidBytes);
         uint256 n = tcbmBytes.length;
@@ -163,8 +176,9 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
         string calldata platformCpuSvn,
         string calldata platformPceSvn
     ) external view returns (string memory tcbm) {
-        (bytes16 qeidBytes, bytes2 pceidBytes, bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes,) =
-            _parseStringInputs(qeid, pceid, platformCpuSvn, platformPceSvn, "");
+        (bytes16 qeidBytes, bytes2 pceidBytes) = _parseQeidAndPceid(qeid, pceid);
+        (bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes) =
+            _parsePlatformSvns(platformCpuSvn, platformPceSvn);
         bytes18 tcbmBytes =
             _tcbrToTcbmMapping(TCB_MAPPING_KEY(qeidBytes, pceidBytes, platformCpuSvnBytes, platformPceSvnBytes));
         if (tcbmBytes != bytes18(0)) {
@@ -186,7 +200,8 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
         string calldata tcbm,
         bytes calldata cert
     ) external pckCACheck(ca) returns (bytes32 attestationId) {
-        (bytes16 qeidBytes, bytes2 pceidBytes,,, bytes18 tcbmBytes) = _parseStringInputs(qeid, pceid, "", "", tcbm);
+        (bytes16 qeidBytes, bytes2 pceidBytes) = _parseQeidAndPceid(qeid, pceid);
+        bytes18 tcbmBytes = _parseTcbm(tcbm);
         (bytes32 hash, bytes32 key, X509CertObj memory pck) = _validatePck(ca, cert, qeidBytes, pceidBytes, tcbmBytes);
 
         // attest timestamp
@@ -214,13 +229,10 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
         string calldata platformPceSvn,
         string calldata tcbm
     ) external returns (bytes32) {
-        (
-            bytes16 qeidBytes,
-            bytes2 pceidBytes,
-            bytes16 platformCpuSvnBytes,
-            bytes2 platformPceSvnBytes,
-            bytes18 tcbmBytes
-        ) = _parseStringInputs(qeid, pceid, platformCpuSvn, platformPceSvn, tcbm);
+        (bytes16 qeidBytes, bytes2 pceidBytes) = _parseQeidAndPceid(qeid, pceid);
+        (bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes) =
+            _parsePlatformSvns(platformCpuSvn, platformPceSvn);
+        bytes18 tcbmBytes = _parseTcbm(tcbm);
 
         bytes32 pckKey = PCK_KEY(qeidBytes, pceidBytes, tcbmBytes);
 
@@ -356,9 +368,13 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
             // check issuer evocation status
             bytes memory rootCrl = _fetchDataFromResolver(Pcs.PCS_KEY(CA.ROOT, true), false);
             if (rootCrl.length > 0) {
-                bool issuerRevoked = crlLib.serialNumberIsRevoked(pck.serialNumber, rootCrl);
+                // the root CRL lists the serial numbers of the revoked CA certificates and not
+                // the serial numbers of the leaf certificates, so the serial number of the
+                // issuer certificate has to be checked against it
+                uint256 issuerSerialNumber = X509Helper(x509).getSerialNumber(issuerCert);
+                bool issuerRevoked = crlLib.serialNumberIsRevoked(issuerSerialNumber, rootCrl);
                 if (issuerRevoked) {
-                    revert Issuer_Revoked(ca, pck.serialNumber);
+                    revert Issuer_Revoked(ca, issuerSerialNumber);
                 }
             }
 
@@ -399,40 +415,45 @@ abstract contract PckDao is DaoBase, SigVerifyBase {
     }
 
     /**
-     * @notice converts the hexstring inputs to bytes
+     * @notice converts the hexstring qeid and pceid inputs to bytes
+     * @dev the length of every input is validated, so that a malformed input cannot be parsed
+     * into a zero value and used to store or look up a collateral under an all-zero key
      */
-    function _parseStringInputs(
-        string memory qeid,
-        string memory pceid,
-        string memory platformCpuSvn,
-        string memory platformPceSvn,
-        string memory tcbm
-    )
+    function _parseQeidAndPceid(string memory qeid, string memory pceid)
         internal
         pure
-        returns (
-            bytes16 qeidBytes,
-            bytes2 pceidBytes,
-            bytes16 platformCpuSvnBytes,
-            bytes2 platformPceSvnBytes,
-            bytes18 tcbmBytes
-        )
+        returns (bytes16 qeidBytes, bytes2 pceidBytes)
     {
-        if (bytes(qeid).length == 32) {
-            qeidBytes = bytes16(uint128(_parseUintFromHex(qeid)));
-        }
-        if (bytes(pceid).length == 4) {
-            pceidBytes = bytes2(uint16(_parseUintFromHex(pceid)));
-        }
-        if (bytes(platformCpuSvn).length == 32) {
-            platformCpuSvnBytes = bytes16(uint128(_parseUintFromHex(platformCpuSvn)));
-        }
-        if (bytes(platformPceSvn).length == 4) {
-            platformPceSvnBytes = bytes2(uint16(_parseUintFromHex(platformPceSvn)));
-        }
-        if (bytes(tcbm).length == 36) {
-            tcbmBytes = bytes18(uint144(_parseUintFromHex(tcbm)));
-        }
+        require(bytes(qeid).length == 32, Invalid_Qeid_Length());
+        require(bytes(pceid).length == 4, Invalid_Pceid_Length());
+        qeidBytes = bytes16(uint128(_parseUintFromHex(qeid)));
+        pceidBytes = bytes2(uint16(_parseUintFromHex(pceid)));
+    }
+
+    /**
+     * @notice converts the hexstring platform SVN inputs to bytes
+     * @dev the length of every input is validated, so that a malformed input cannot be parsed
+     * into a zero value and used to store or look up a collateral under an all-zero key
+     */
+    function _parsePlatformSvns(string memory platformCpuSvn, string memory platformPceSvn)
+        internal
+        pure
+        returns (bytes16 platformCpuSvnBytes, bytes2 platformPceSvnBytes)
+    {
+        require(bytes(platformCpuSvn).length == 32, Invalid_Platform_Cpu_Svn_Length());
+        require(bytes(platformPceSvn).length == 4, Invalid_Platform_Pce_Svn_Length());
+        platformCpuSvnBytes = bytes16(uint128(_parseUintFromHex(platformCpuSvn)));
+        platformPceSvnBytes = bytes2(uint16(_parseUintFromHex(platformPceSvn)));
+    }
+
+    /**
+     * @notice converts the hexstring tcbm input to bytes
+     * @dev the length of the input is validated, so that a malformed input cannot be parsed into
+     * a zero value and used to store or look up a collateral under an all-zero key
+     */
+    function _parseTcbm(string memory tcbm) internal pure returns (bytes18 tcbmBytes) {
+        require(bytes(tcbm).length == 36, Invalid_Tcbm_Length());
+        tcbmBytes = bytes18(uint144(_parseUintFromHex(tcbm)));
     }
 
     function _storePckValidity(bytes32 key, uint64 notValidBefore, uint64 notValidAfter) internal virtual;
